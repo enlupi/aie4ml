@@ -28,6 +28,9 @@ class LowerToAieIr(ModelOptimizerPass):
     def __init__(self):
         self.name = 'lower_to_aie_ir'
 
+
+    # TO DO: ADD SUPPORT FOR ACTIVATION NODE
+
     def transform(self, model) -> bool:
         ctx = ensure_backend_context(model, lambda: self._create_context(model))
         ctx.reset_ir()
