@@ -189,21 +189,27 @@ class IntegerQuantizer(ModelOptimizerPass):
         changed = False
 
         for node in ctx.ir.logical:
-            if node.op_type != 'dense':
+            if node.op_type != 'dense' and node.op_type != 'activation':
                 continue
 
             source_layer_name = node.metadata.get('source_layer')
+            print("Processing IR node:", node.name, "of type:", node.op_type, "from source layer:", source_layer_name)
             layer = lookup_layer(model, source_layer_name)
             if layer is None:
                 log.warning('Unable to locate source layer "%s" for IR node %s.', source_layer_name, node.name)
                 continue
 
-            if _has_data(node.artifacts.get('quant_weights')):
-                continue
+            if node.op_type == 'dense':
+                if _has_data(node.artifacts.get('quant_weights')):
+                    continue
 
-            if self._quantize_dense_node(model, ctx, node, layer):
-                changed = True
-
+                if self._quantize_dense_node(model, ctx, node, layer):
+                    changed = True
+            
+            elif node.op_type == 'activation':
+                if self._quantize_activation_node(model, ctx, node, layer):
+                    changed = True
+        
         return changed
 
     def _quantize_dense_node(self, model, ctx, node, layer) -> bool:
@@ -261,5 +267,29 @@ class IntegerQuantizer(ModelOptimizerPass):
         if bias_intent is not None:
             quant_metadata['bias_precision'] = bias_intent
         quant_metadata['output_precision'] = output_intent
+
+        print(f"Quantization info for layer {layer.name}: {quant_metadata}")
+
+        return True
+
+    def _quantize_activation_node(self, model, ctx, node, layer) -> bool:
+
+        print("Running activation quantization for layer:", layer.name)
+
+        input_var = layer.get_input_variable()
+        output_var = layer.get_output_variable()
+        input_precision = getattr(input_var.type, 'precision', None)
+        result_precision = getattr(output_var.type, 'precision', None)
+        if input_precision is None or result_precision is None:
+            raise RuntimeError(f'Layer {layer.name}: missing precision metadata; run hls4ml quantization first.')
+
+        input_intent = _to_quant_intent(input_precision)
+        output_intent = _to_quant_intent(result_precision)
+
+        quant_metadata = node.metadata.setdefault('quant', {})
+        quant_metadata['input_precision'] = input_intent
+        quant_metadata['output_precision'] = output_intent
+
+        print(f"Quantization info for layer {layer.name}: {quant_metadata}")
 
         return True
