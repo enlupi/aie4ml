@@ -21,12 +21,15 @@ class FuseActivationCasts(ModelOptimizerPass):
             return False
 
         prev_node = node.inputs[0].producer
-        if prev_node is None or \
-            (getattr(prev_node, 'op_type', None) != 'dense' and \
-             getattr(prev_node, 'op_type', None) != 'input'):
+        if prev_node is None:
             return False
-
-        return True
+        match getattr(prev_node, 'op_type', None):
+            case 'dense':
+                return True
+            case 'input':
+                return act == 'linear'
+            case _:
+                return False
     
     def transform(self, model) -> bool:
         ctx = get_backend_context(model)
