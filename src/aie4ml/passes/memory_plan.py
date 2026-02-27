@@ -30,6 +30,14 @@ class _EdgeEntry:
     producer_ports: int
     consumers: List[_Connection] = field(default_factory=list)
     graph_output: bool = False
+    producer_port_ids: List[int] = field(default_factory=list)
+    consumer_port_ids: List[int] = field(default_factory=list)
+    shard_dim: Optional[int] = None
+    shard_port_stride: Optional[int] = None
+    shard_dim_base: int = 0
+    shard_dim_size: Optional[int] = None
+    shard_index: int = 0
+    shard_count: int = 1
 
 
 class BuildMemoryPlan(ModelOptimizerPass):
@@ -42,6 +50,30 @@ class BuildMemoryPlan(ModelOptimizerPass):
         return True
 
 
+class CollectMemoryEntries(ModelOptimizerPass):
+    def __init__(self):
+        self.name = 'collect_memory_entries'
+
+    def transform(self, model) -> bool:
+        ctx = get_backend_context(model)
+        planner = _CodegenPlanner(ctx)
+        state = planner.collect(list(ctx.ir.logical))
+        ctx.ir.physical.plan = {'_memory_plan_state': state}
+        return True
+
+
+class MaterializeMemoryPlan(ModelOptimizerPass):
+    def __init__(self):
+        self.name = 'materialize_memory_plan'
+
+    def transform(self, model) -> bool:
+        ctx = get_backend_context(model)
+        planner = _CodegenPlanner(ctx)
+        state = ctx.ir.physical.plan['_memory_plan_state']
+        ctx.ir.physical.plan = planner.materialize(state)
+        return True
+
+
 class _CodegenPlanner:
     def __init__(self, ctx):
         self.ctx = ctx
@@ -50,8 +82,15 @@ class _CodegenPlanner:
         self.buffers = []
         self.direct_edges = []
         self.layer_indices = {}
+        self._next_graph_output_port = 0
+        self._max_graph_input_port = -1
+        self._buffer_seq: Dict[str, int] = {}
 
     def build(self, nodes):
+        state = self.collect(nodes)
+        return self.materialize(state)
+
+    def collect(self, nodes):
         idx = 0
         for n in nodes:
             if self._kernel_inst(n):
@@ -60,13 +99,27 @@ class _CodegenPlanner:
 
         conns = self._collect_connections(nodes)
         entries = self._group_edges(conns)
+        return {
+            'layer_indices': dict(self.layer_indices),
+            'entries': entries,
+        }
 
-        for e in entries:
-            self._materialize_entry(e)
+    def materialize(self, state):
+        self.buffers = []
+        self.direct_edges = []
+        self.layer_indices = dict(state['layer_indices'])
+        self._next_graph_output_port = 0
+        self._max_graph_input_port = -1
+        self._buffer_seq = {}
+
+        for entry in state['entries']:
+            self._materialize_entry(entry)
 
         return {
             'buffers': self.buffers,
             'direct_edges': self.direct_edges,
+            'graph_input_count': self._max_graph_input_port + 1,
+            'graph_output_count': self._next_graph_output_port,
         }
 
     # -------------------------------------------------------------------------
@@ -153,31 +206,39 @@ class _CodegenPlanner:
     # ------------------------------------------------------------------
 
     def _materialize_entry(self, entry: _EdgeEntry):
-        p = max(1, entry.producer_ports)
-        c = sum(self._consumer_port_count(x.consumer, entry.tensor) for x in entry.consumers)
+        if len(entry.consumers) > 1:
+            raise RuntimeError(f'{entry.tensor}: materializer requires at most one consumer per entry.')
+        if entry.consumers and entry.graph_output:
+            raise RuntimeError(f'{entry.tensor}: materializer does not accept mixed consumer + graph_output entry.')
+        if not entry.producer_port_ids:
+            raise RuntimeError(f'{entry.tensor}: missing producer_port_ids; run port-limit legalization first.')
+        if entry.shard_dim is None or entry.shard_port_stride is None or entry.shard_dim_size is None:
+            raise RuntimeError(f'{entry.tensor}: missing shard metadata; run port-limit legalization first.')
 
-        units = self._required_units(p, c)
+        p_ports = [int(x) for x in entry.producer_port_ids]
+        c_ports = [int(x) for x in entry.consumer_port_ids]
+
         route = self._route_policy(entry)
         direct_eligible = (
-            units == 1
+            entry.shard_count == 1
             and entry.producer
             and not entry.graph_output
             and len(entry.consumers) == 1
-            and p == 1
-            and self._consumer_port_count(entry.consumers[0].consumer, entry.tensor) == 1
+            and len(p_ports) == 1
+            and len(c_ports) == 1
             and entry.consumers[0].consumer.traits['io_view'].data['inputs'][entry.tensor].get('perm') is None
         )
 
         if route == 'direct':
             if not direct_eligible:
                 raise RuntimeError(f'{entry.tensor}: io_route=direct requested but direct transport is not legal.')
-            self._emit_direct(entry, p)
+            self._emit_direct(entry, 1)
             return
 
         if direct_eligible and route != 'memtile':
-            self._emit_direct(entry, p)
+            self._emit_direct(entry, 1)
         else:
-            self._emit_memtile(entry, p, units)
+            self._emit_memtile(entry, p_ports, c_ports)
 
     def _route_policy(self, entry: _EdgeEntry) -> str:
         if entry.producer is None or entry.graph_output:
@@ -225,212 +286,105 @@ class _CodegenPlanner:
     # Memtile
     # ------------------------------------------------------------------
 
-    def _emit_memtile(self, entry, producer_ports, units):
-        consumers = entry.consumers
-        consumer_ports = sum(self._consumer_port_count(c.consumer, entry.tensor) for c in consumers)
-        if entry.graph_output:
-            consumer_ports = producer_ports
-        if units > 1:
-            if consumer_ports < producer_ports:
-                raise RuntimeError(
-                    f'{entry.tensor}: units={units} requires consumer_ports >= producer_ports '
-                    f'(p={producer_ports}, c={consumer_ports}).'
-                )
-            if consumer_ports % producer_ports != 0:
-                raise RuntimeError(
-                    f'{entry.tensor}: units={units} requires consumer_ports be a multiple of producer_ports '
-                    f'(p={producer_ports}, c={consumer_ports}).'
-                )
-
-        # SERIAL port split (contiguous blocks; unit0 gets first chunk, unit1 next, ...)
-        p_chunks = self._split_ports_serial(producer_ports, units)
-        if units == 1:
-            c_chunks = [list(range(consumer_ports))]
-        else:
-            mult = consumer_ports // producer_ports
-            c_chunks = []
-            start = 0
-            for p_ports in p_chunks:
-                size = len(p_ports) * mult
-                c_chunks.append(list(range(start, start + size)))
-                start += size
-            if start != consumer_ports:
-                raise RuntimeError(
-                    f'{entry.tensor}: internal error computing consumer sharding '
-                    f'(expected {consumer_ports} ports, assigned {start}).'
-                )
-
-        # Determine shard stride per port in buffer space (required for sharding/rebasing).
+    def _emit_memtile(self, entry, p_ports, c_ports):
         if entry.producer:
             inst = self._kernel_inst(entry.producer)
-            d0 = inst.variant.describe_output_staging(entry.producer, inst.attributes, entry.tensor, 0, None, None)
-            d1 = (
-                inst.variant.describe_output_staging(entry.producer, inst.attributes, entry.tensor, 1, None, None)
-                if producer_ports > 1
-                else None
-            )
-            shard_dim = int(d0['slice_dimension'])
-            port_stride0 = (
-                int(d1['offset'][shard_dim] - d0['offset'][shard_dim])
-                if d1 is not None
-                else int(d0['buffer_dimension'][shard_dim])
-            )
-            full_dim0 = int(d0['buffer_dimension'][shard_dim])
+            base = inst.variant.describe_output_staging(entry.producer, inst.attributes, entry.tensor, 0, None, None)
         else:
-            c0 = consumers[0].consumer
-            inst = self._kernel_inst(c0)
-            d0 = inst.variant.describe_input_staging(c0, inst.attributes, entry.tensor, 0, None, None, None)
-            d1 = (
-                inst.variant.describe_input_staging(c0, inst.attributes, entry.tensor, 1, None, None, None)
-                if producer_ports > 1
-                else None
-            )
-            shard_dim = int(d0['slice_dimension'])
-            port_stride0 = (
-                int(d1['offset'][shard_dim] - d0['offset'][shard_dim])
-                if d1 is not None
-                else int(d0['buffer_dimension'][shard_dim])
-            )
-            full_dim0 = int(d0['buffer_dimension'][shard_dim])
-        if full_dim0 != port_stride0 * int(producer_ports):
-            raise RuntimeError(
-                f'{entry.tensor}: cannot shard dim{shard_dim}; '
-                f'expected buffer_dimension[{shard_dim}] == port_stride * ports '
-                f'({full_dim0} != {port_stride0} * {producer_ports}).'
-            )
+            base = self._graph_input_writer_descriptor(entry)
 
-        # Prefix sums of sharded dim0 sizes, used for offset rebasing.
-        unit_dim0_sizes = [len(chunk) * port_stride0 for chunk in p_chunks]
-        unit_dim0_bases: List[int] = []
-        acc = 0
-        for size in unit_dim0_sizes:
-            unit_dim0_bases.append(acc)
-            acc += int(size)
+        shard_dim = int(entry.shard_dim)
+        port_stride = int(entry.shard_port_stride)
+        unit_base_dim0 = int(entry.shard_dim_base)
+        full_dims = list(base['buffer_dimension'])
+        buf_dims = list(full_dims)
+        buf_dims[shard_dim] = int(entry.shard_dim_size)
 
-        for u in range(units):
-            p_ports = p_chunks[u]
-            c_ports = c_chunks[u]
-            if not p_ports and not c_ports:
-                continue
-            if len(p_ports) > self.device.max_mem_in_ports:
-                raise RuntimeError(
-                    f'{entry.tensor}: unit {u+1} exceeds memtile in-port limit '
-                    f'({len(p_ports)} > {self.device.max_mem_in_ports}).'
-                )
-            if len(c_ports) > self.device.max_mem_out_ports:
-                raise RuntimeError(
-                    f'{entry.tensor}: unit {u+1} exceeds memtile out-port limit '
-                    f'({len(c_ports)} > {self.device.max_mem_out_ports}).'
-                )
+        name = self._next_buffer_name(entry)
+        buffer = {
+            'name': name,
+            'dimension': buf_dims,
+            'num_buffers': 2,
+            'ctype': self._buffer_ctype(entry),
+            'writers': [],
+            'readers': [],
+            'tensor': entry.tensor,
+        }
 
-            # base descriptor
-            if entry.producer:
-                inst = self._kernel_inst(entry.producer)
-                base = inst.variant.describe_output_staging(
-                    entry.producer, inst.attributes, entry.tensor, 0, None, None
-                )
+        base_p = p_ports[0]
+        for slot, p in enumerate(p_ports):
+            if entry.producer is None:
+                desc = self._graph_input_writer_descriptor(entry)
+                desc['buffer_dimension'] = list(buf_dims)
+                desc['offset'][shard_dim] = (int(p) - int(base_p)) * int(port_stride)
+                self._max_graph_input_port = max(self._max_graph_input_port, int(p))
             else:
-                base = self._graph_input_writer_descriptor(entry)
+                inst = self._kernel_inst(entry.producer)
+                staging = self._output_staging(inst, entry.tensor)
+                desc = inst.variant.describe_output_staging(
+                    entry.producer, inst.attributes, entry.tensor, p, buf_dims, staging
+                )
+                desc['buffer_dimension'] = list(buf_dims)
+                desc['offset'][shard_dim] -= int(unit_base_dim0)
 
-            full_dims = list(base['buffer_dimension'])
-            shard_size = int(unit_dim0_sizes[u])
-            buf_dims = list(full_dims)
-            buf_dims[shard_dim] = shard_size
-            unit_base_dim0 = int(unit_dim0_bases[u])
+            buffer['writers'].append(
+                {
+                    'source': self._producer_endpoint(entry.producer, entry.producer_group, p),
+                    'source_type': self._producer_endpoint_meta(entry.producer, entry.producer_group, p)[0],
+                    'source_endpoint': self._producer_endpoint_meta(entry.producer, entry.producer_group, p)[1],
+                    'target': f'{name}.in[{slot}]',
+                    'descriptor': desc,
+                }
+            )
 
-            name = self._buffer_name(entry.tensor, u, units)
+        if entry.consumers:
+            consumer_conn = entry.consumers[0]
+            for local_out, i in enumerate(c_ports):
+                inst = self._kernel_inst(consumer_conn.consumer)
+                staging = self._input_staging(inst, entry.tensor)
+                desc = inst.variant.describe_input_staging(
+                    consumer_conn.consumer, inst.attributes, entry.tensor, i, buf_dims, staging, entry.producer
+                )
+                desc['buffer_dimension'] = list(buf_dims)
+                desc['offset'][shard_dim] -= int(unit_base_dim0)
+                if int(entry.shard_count) > 1:
+                    desc['boundary_dimension'] = list(buf_dims)
 
-            buffer = {
-                'name': name,
-                'dimension': buf_dims,
-                'num_buffers': 2,
-                'ctype': self._buffer_ctype(entry),
-                'writers': [],
-                'readers': [],
-                'tensor': entry.tensor,
-            }
-
-            # writers
-            base_p = p_ports[0] if p_ports else 0
-            for slot, p in enumerate(p_ports):
-                if entry.producer is None:
-                    desc = self._graph_input_writer_descriptor(entry)
-                    desc['buffer_dimension'] = list(buf_dims)
-                    desc['offset'][shard_dim] = (p - base_p) * port_stride0
-                else:
-                    inst = self._kernel_inst(entry.producer)
-                    staging = self._output_staging(inst, entry.tensor)
-                    desc = inst.variant.describe_output_staging(
-                        entry.producer, inst.attributes, entry.tensor, p, buf_dims, staging
-                    )
-                    desc['buffer_dimension'] = list(buf_dims)
-                    desc['offset'][shard_dim] -= unit_base_dim0
-
-                buffer['writers'].append(
+                buffer['readers'].append(
                     {
-                        'source': self._producer_endpoint(entry.producer, entry.producer_group, p),
-                        'source_type': self._producer_endpoint_meta(entry.producer, entry.producer_group, p)[0],
-                        'source_endpoint': self._producer_endpoint_meta(entry.producer, entry.producer_group, p)[1],
-                        'target': f'{name}.in[{slot}]',
+                        'source': f'{name}.out[{local_out}]',
+                        'target': (
+                            f'{sanitize_identifier(consumer_conn.consumer.name)}.'
+                            f'{consumer_conn.consumer_group}[{i}]'
+                        ),
+                        'target_type': 'kernel',
+                        'target_endpoint': {
+                            'kernel': consumer_conn.consumer.name,
+                            'kernel_id': sanitize_identifier(consumer_conn.consumer.name),
+                            'group': consumer_conn.consumer_group,
+                            'port': int(i),
+                        },
                         'descriptor': desc,
                     }
                 )
 
-            # readers
-            base_c = c_ports[0] if c_ports else 0
-            flat = 0
-            for c in consumers:
-                for i in range(self._consumer_port_count(c.consumer, entry.tensor)):
-                    if flat not in c_ports:
-                        flat += 1
-                        continue
+        if entry.graph_output:
+            reader_base = len(buffer['readers'])
+            for slot, local_port in enumerate(p_ports):
+                graph_port = self._next_graph_output_port
+                self._next_graph_output_port += 1
+                desc = self._graph_output_reader_descriptor(entry, local_port, buf_dims, unit_base_dim0=unit_base_dim0)
+                buffer['readers'].append(
+                    {
+                        'source': f'{name}.out[{reader_base + slot}]',
+                        'target': f'ofm[{graph_port}]',
+                        'target_type': 'plio',
+                        'target_endpoint': {'name': 'ofm', 'port': int(graph_port), 'kernel_port': int(local_port)},
+                        'descriptor': desc,
+                    }
+                )
 
-                    inst = self._kernel_inst(c.consumer)
-                    staging = self._input_staging(inst, entry.tensor)
-                    desc = inst.variant.describe_input_staging(
-                        c.consumer, inst.attributes, entry.tensor, i, buf_dims, staging, entry.producer
-                    )
-                    desc['buffer_dimension'] = list(buf_dims)
-                    desc['offset'][shard_dim] -= unit_base_dim0
-                    if units > 1:
-                        desc['boundary_dimension'] = list(buf_dims)
-                    local_out = flat - base_c
-
-                    buffer['readers'].append(
-                        {
-                            'source': f'{name}.out[{local_out}]',
-                            'target': f'{sanitize_identifier(c.consumer.name)}.{c.consumer_group}[{i}]',
-                            'target_type': 'kernel',
-                            'target_endpoint': {
-                                'kernel': c.consumer.name,
-                                'kernel_id': sanitize_identifier(c.consumer.name),
-                                'group': c.consumer_group,
-                                'port': int(i),
-                            },
-                            'descriptor': desc,
-                        }
-                    )
-                    flat += 1
-
-            if entry.graph_output:
-                for slot, port in enumerate(p_ports):
-                    desc = self._graph_output_reader_descriptor(
-                        entry,
-                        port,
-                        buf_dims,
-                        unit_base_dim0=unit_base_dim0,
-                    )
-                    buffer['readers'].append(
-                        {
-                            'source': f'{name}.out[{slot}]',
-                            'target': f'ofm[{port}]',
-                            'target_type': 'plio',
-                            'target_endpoint': {'name': 'ofm', 'port': int(port)},
-                            'descriptor': desc,
-                        }
-                    )
-
-            self.buffers.append(buffer)
+        self.buffers.append(buffer)
 
     # -------------------------------------------------------------------------
     # Graph IO descriptors
@@ -488,16 +442,6 @@ class _CodegenPlanner:
         st = inst.attributes.staging['outputs']
         return st[tensor] if tensor in st else None
 
-    def _split_ports_serial(self, n, units):
-        chunk = (n + units - 1) // units
-        out = []
-        start = 0
-        for _ in range(units):
-            size = min(chunk, n - start)
-            out.append(list(range(start, start + size)))
-            start += size
-        return out
-
     def _kernel_inst(self, node):
         return self.ctx.ir.kernels.get(node.name) if node else None
 
@@ -538,13 +482,18 @@ class _CodegenPlanner:
             return f'typename Cfg{self.layer_indices[c.name]}::data_t'
         return f'typename Cfg{self.layer_indices[entry.producer.name]}::result_t'
 
-    def _required_units(self, p, c):
-        return max(
-            (p + self.device.max_mem_in_ports - 1) // self.device.max_mem_in_ports,
-            (c + self.device.max_mem_out_ports - 1) // self.device.max_mem_out_ports,
-        )
+    def _next_buffer_name(self, entry: _EdgeEntry):
+        base = sanitize_identifier(entry.tensor)
+        suffix = ''
+        if int(entry.shard_count) > 1:
+            suffix += f'_u{int(entry.shard_index)}'
+        fan_index = getattr(entry, 'fan_index', None)
+        if fan_index is not None:
+            suffix += f'_fan{int(fan_index)}'
 
-    @staticmethod
-    def _buffer_name(tensor, idx, total):
-        base = sanitize_identifier(tensor)
-        return f'buffer_{base}' if total == 1 else f'buffer_{base}_u{idx+1}'
+        key = f'{base}{suffix}'
+        idx = self._buffer_seq.get(key, 0) + 1
+        self._buffer_seq[key] = idx
+
+        stem = f'buffer_{base}{suffix}'
+        return stem if idx == 1 else f'{stem}_{idx}'

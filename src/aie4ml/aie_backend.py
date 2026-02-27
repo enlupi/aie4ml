@@ -61,8 +61,20 @@ class AIEBackend(Backend):
         resolve_flow = register_flow('resolve', ['aie:resolve'], requires=[fold_views_flow], backend=self.name)
         pack_flow = register_flow('pack', ['aie:pack_kernel_artifacts'], requires=[resolve_flow], backend=self.name)
         placement_flow = register_flow('placement', ['aie:place_kernels'], requires=[pack_flow], backend=self.name)
+        memory_collect_flow = register_flow(
+            'memory_collect', ['aie:collect_memory_entries'], requires=[placement_flow], backend=self.name
+        )
+        fanout_legalize_flow = register_flow(
+            'fanout_legalize', ['aie:legalize_fanout_entries'], requires=[memory_collect_flow], backend=self.name
+        )
+        memtile_legalize_flow = register_flow(
+            'memtile_legalize',
+            ['aie:legalize_memtile_port_limits'],
+            requires=[fanout_legalize_flow],
+            backend=self.name,
+        )
         memory_plan_flow = register_flow(
-            'memory_plan', ['aie:build_memory_plan'], requires=[placement_flow], backend=self.name
+            'memory_plan', ['aie:materialize_memory_plan'], requires=[memtile_legalize_flow], backend=self.name
         )
         template_flow = register_flow(
             'apply_templates', self._get_layer_templates, requires=[memory_plan_flow], backend=self.name

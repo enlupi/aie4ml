@@ -270,6 +270,7 @@ def build_io_layout(model) -> IOLayout:
             if reader['target_endpoint']['name'] != 'ofm':
                 continue
             port = int(reader['target_endpoint']['port'])
+            kernel_port = int(reader['target_endpoint']['kernel_port'])
 
             writer = next(w for w in buf['writers'] if w['source_type'] == 'kernel')
             inst = ctx.ir.kernels.get(writer['source_endpoint']['kernel'])
@@ -278,7 +279,7 @@ def build_io_layout(model) -> IOLayout:
                 inst.node,
                 inst.attributes,
                 tensor,
-                port,
+                kernel_port,
                 None,
                 None,
             )
