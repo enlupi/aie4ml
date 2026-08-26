@@ -3,3 +3,4 @@ _version.py
 __pycache__
 examples/*
 src/aie4ml.egg*
+docs/vendor
