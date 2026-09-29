@@ -74,19 +74,28 @@ def _tile_bank_usage(
     }
 
 
-def _supported_microtile_options(op_type: str, generation: str, lhs_dtype, rhs_dtype):
-    return get_op_impl_registry().supported_microtilings(
-        op_type, generation, (legality_format(lhs_dtype.format), legality_format(rhs_dtype.format))
-    )
+def _supported_microtile_options(variant, op_type: str, generation: str, lhs_dtype, rhs_dtype):
+    """Legal microtiles for the variant that is doing the resolving.
+
+    Asks the variant directly rather than searching the registry. Within one family the answer
+    is variant-specific -- the sparse dense variants need shapes with a sparse `aie::mmul`
+    overload, which is a different set from the dense ones -- so a registry-wide lookup keyed
+    only on `op_type` would hand a variant somebody else's table. `variant=None` keeps the old
+    registry search for any caller outside a variant's own `resolve()`.
+    """
+    query = (legality_format(lhs_dtype.format), legality_format(rhs_dtype.format))
+    if variant is not None:
+        return list(variant.microtiling_options(generation, query))
+    return get_op_impl_registry().supported_microtilings(op_type, generation, query)
 
 
-def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype) -> MatmulMicrotileConfig:
+def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype, variant=None) -> MatmulMicrotileConfig:
     microtiling_cfg = node.directives.get('microtiling', {}) or {}
     raw = {
         key: int(microtiling_cfg[key]) if key in microtiling_cfg else 0
         for key in ('microtile_m', 'microtile_n', 'microtile_k')
     }
-    options = _supported_microtile_options(node.op_type, device.generation, lhs_dtype, rhs_dtype)
+    options = _supported_microtile_options(variant, node.op_type, device.generation, lhs_dtype, rhs_dtype)
     if not options:
         raise ValueError(
             f'{node.name}: no supported tile configs are registered for Generation={device.generation} and '

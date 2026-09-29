@@ -117,7 +117,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         io_route, _, _ = parse_directives(directives)
         precision = _resolve_numeric(node, device)
         precision['bias'] = _resolve_bias_dtype(node, precision)
-        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
+        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'], variant=self)
         tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract)
         io_views = _build_matmul_io_views(node, microtiling, tiling)
 

@@ -20,6 +20,13 @@ class OpImplRegistry:
         return sorted(self._variants.get(op_type, []), key=lambda v: v.plevel, reverse=True)
 
     def supported_microtilings(self, op_type: str, generation: str, query) -> List[Tuple[int, int, int]]:
+        """Legal microtile shapes for `op_type`, from the highest-plevel variant that answers.
+
+        Only meaningful where every variant of `op_type` shares one table. Variants of a family
+        can disagree -- the sparse dense variants need shapes with a sparse `aie::mmul` overload,
+        a different set from the dense ones -- so code inside a variant's `resolve()` should ask
+        that variant directly (see `_supported_microtile_options`) rather than call this.
+        """
         for variant in self.candidates(op_type):
             try:
                 return variant.microtiling_options(generation, query)
