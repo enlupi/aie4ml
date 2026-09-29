@@ -30,7 +30,7 @@ public:
   using bias_t   = typename dense_base<ConfigT>::bias_t;
 
   void run(input_buffer<data_t>&       ifm,
-           const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+           const weight_t (&wts)[ConfigT::WTS_ELEMS],
            const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
            output_buffer<result_t>&      ofm);
 
@@ -48,7 +48,7 @@ public:
   using acc_scalar_t  = typename dense_base<ConfigT>::acc_scalar_t;
 
   void run(input_buffer<data_t>&          ifm,
-            const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+            const weight_t (&wts)[ConfigT::WTS_ELEMS],
             output_cascade<acc_scalar_t>* outCascade);
 
   static void registerKernelClass() { REGISTER_FUNCTION(dense_first::run); }
@@ -63,7 +63,7 @@ public:
   using acc_scalar_t  = typename dense_base<ConfigT>::acc_scalar_t;
 
   void run(input_buffer<data_t>&          ifm,
-            const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+            const weight_t (&wts)[ConfigT::WTS_ELEMS],
             input_cascade<acc_scalar_t>*  inCascade,
             output_cascade<acc_scalar_t>* outCascade);
 
@@ -80,7 +80,7 @@ public:
   using bias_t   = typename dense_base<ConfigT>::bias_t;
 
   void run(input_buffer<data_t>&         ifm,
-            const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+            const weight_t (&wts)[ConfigT::WTS_ELEMS],
             input_cascade<acc_scalar_t>* inCascade,
             const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
             output_buffer<result_t>&        ofm);

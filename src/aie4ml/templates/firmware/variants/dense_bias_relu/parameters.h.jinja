@@ -21,6 +21,11 @@ struct {{L.struct_name}} {
   static constexpr int OUT_FEAT_SLICE = {{P.tile_inner_rhs}};
   static constexpr int RAW_IN_FEAT_SLICE = {{P.tile_inner_lhs_raw}};
   static constexpr int RAW_OUT_FEAT_SLICE = {{P.tile_inner_rhs_raw}};
+  // Dense weight path: the kernel's shared sparse/dense selector is off, and the weight ROM is
+  // the plain IN_FEAT_SLICE x OUT_FEAT_SLICE product. See the dense_bias_relu_sparse variant
+  // for the AIE-ML hardware sparse (2:4) path.
+  static constexpr bool USE_SPARSE = false;
+  static constexpr int SPARSE_TILE_BYTES = 0;
   static constexpr int WTS_ELEMS = {{P.wts_elems}};
   using acc_scalar_t = {{ P.accumulator_tag }};
   static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
