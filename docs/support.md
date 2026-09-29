@@ -6,6 +6,7 @@
 | Operator / feature | Current support | Notes and limitations |
 | --- | --- | --- |
 | Dense / GEMM | Int8/int16, BF16, FP8 | Read-only RTP weights; optional bias and fused ReLU; configurable cascade parallelism. |
+| Sparse Dense / GEMM | **AIE-ML only** (int8 x int8, int16 x int8, int16 x int16); AIE-MLv2 is incorrect -- see below | **Detected automatically, numerically free.** Every Dense layer's trained weights are inspected; a layer that is *already* 2:4-structured along the reduction axis (at most 2 nonzeros per 4 consecutive input features, per output column) is stored in the AIE-ML hardware-compressed format (0.625x the dense ROM) and run on the sparse `aie::mmul` path. **aie4ml never prunes** -- creating the pattern is the training pipeline's job -- so compilation never changes a weight, and the sparse path is chosen on merit rather than paid for in accuracy. A layer that is not already 2:4, or that misses a capability requirement (AIE-ML or AIE-MLv2, integer precisions, 8- or 16-bit constant weights, a sparse-capable microtile), is compiled dense; if it nonetheless has >=50% zero weights, a warning names the layer and says the pattern is unusable. `sparsity: {'mode': 'dense'}` opts a qualifying layer out; an explicit `2of4` request on a layer that cannot support it is an error. |
 | Dynamic MatMul | Int8/int16, BF16, FP8 | Rank-2 GEMM ABI. A rank-2 RHS may be broadcast across compacted independent LHS axes; batched RHS MatMul with non-broadcast leading axes is rejected. |
 | Elementwise Add | Quantized integer | Exact-shape inputs for residual and elementwise connections; broadcasting is not supported. |
 | LayerNorm | Quantized integer | Last-axis normalization using integer mean/variance and reciprocal-square-root approximation. Requires supported static quantization and kernel legality constraints. |
@@ -36,6 +37,36 @@
 - Chained folded views are not currently supported.
 - Per-tensor static quantization is the primary supported quantization contract. Per-channel activation quantization is
   not supported.
+- Hardware sparsity is a weight-only, structured 2:4 contract along the reduction axis. Unstructured sparsity,
+  activation sparsity, and runtime-variable sparsity patterns are not supported.
+- The sparsity pattern must come from training. aie4ml detects it and never creates it: there is no pruning step in
+  the compiler, so a weight it was given is a weight the kernel computes.
+- Hardware sparsity is applied opportunistically: aie4ml inspects each Dense layer's weights and never fails a build
+  over sparsity. If a layer whose weights qualify turns out not to be resolvable as sparse, the dense implementation
+  is used and the fallback is logged.
+- Sparse precision pairings are per generation, and narrower than the dense ones. Weights must be 8- or 16-bit.
+  int8 x int8 and int16 x int16 are sparse-capable on AIE-ML and AIE-MLv2; **int16 x int8 only on AIE-ML**, because
+  AIE-MLv2 requires both sparse operands to share a data type (UG1603). Float precisions have no sparse path in
+  aie4ml: bfloat16 has a sparse `aie::mmul` mode but is not wired up, while float32 and fp8 have no sparse mode at
+  all on any generation.
+- int8 x int8, int16 x int8 and int16 x int16 are each verified **on AIE-ML** in x86simulator against the dense path on
+  identical weights; int8 x int8 and int16 x int16 -- the two distinct weight widths -- are additionally verified in
+  aiesimulator.
+- **Hardware sparsity on AIE-MLv2 is unverified and currently unverifiable; do not rely on it.** AIE-MLv2 *dense* is
+  bit-identical to AIE-ML dense, so only the sparse path is in question. AIE-MLv2 *sparse* differs from that reference
+  in 2001 of 2048 output elements, but that measurement is **not evidence about the hardware**: it came from
+  x86simulator, and the installed `aie2ps` intrinsic model
+  (`aietools/data/aie2ps/lib/me_native.h`) contains **no sparse decompression at all** -- no `decompress_sparse`, no
+  `sparse_read8b`/`sparse_read16b`, no `sparse_pop`/`sparse_fill`, where the `aie_ml` model has all of them. So
+  x86simulator cannot execute a sparse kernel correctly on AIE-MLv2 whatever the ROM contains, and cannot be used to
+  validate this path. aiesimulator would be the only trustworthy check and is unavailable here: the hardware compile
+  fails with `Could not load Device Part xc2ve3858-ssva2112-2MP-e-S`, identically for dense, so it is a missing device
+  part rather than anything about sparsity. A second, independent doubt remains open on the aie4ml side: the packer
+  emits the AIE-ML chunk geometry (64-byte chunks, 64-bit mask) while UG1603 states that "for AIE-ML v2, data chunks
+  are 512-bit wide, and the mask and alignment is on 64 bits". Since sparsity is opt-out, a VEK385 Dense layer with
+  already-2:4 weights takes this path **by default**, so set `sparsity: {'mode': 'dense'}` on AIE-MLv2 targets pending
+  a study. The AIE-MLv2 rows of `SPARSE_MICROTILE_OPTIONS` are retained for that study and are not a statement of
+  support.
 
 ## Transport
 

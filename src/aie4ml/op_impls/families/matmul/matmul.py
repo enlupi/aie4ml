@@ -20,6 +20,7 @@ from .common import (
     describe_outer_output_staging,
     describe_outer_rhs_staging,
     requested_contract,
+    requested_sparsity,
 )
 from .config import MatmulConfig, MatmulFlags
 from .dense import _BaseDenseMatmulVariant
@@ -42,6 +43,17 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
+        if requested_sparsity(node) == '2of4':
+            # No sparse matmul variant exists: the sparse path needs its B operand packed into
+            # the compressed layout ahead of time, which only works for a kernel-resident weight
+            # ROM (dense), not a dynamically streamed B. An explicit request fails here rather
+            # than quietly running dense and ignoring the directive. The 'auto' default is
+            # silent, because a dynamic matmul simply never qualifies.
+            raise NotImplementedError(
+                f'{node.name}: sparsity is only supported for the dense family (kernel-resident '
+                'weights); a dynamic matmul streams its B operand at runtime, so it cannot be '
+                'pre-compressed. Remove the sparsity directive or fold the operand into a Dense.'
+            )
         return requested_contract(node) == self.contract and bitwidths_supported(node, device)
 
     def resolve(self, node: OpNode, device, directives=None) -> MatmulConfig:

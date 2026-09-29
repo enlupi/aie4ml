@@ -30,6 +30,7 @@ from .common import (
     pack_vector_by_n_slice,
     quantize_to_int,
     requested_contract,
+    requested_sparsity,
     select_generation_key,
 )
 from .config import DenseConfig, DenseFlags
@@ -111,7 +112,14 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
-        return requested_contract(node) == self.contract and bitwidths_supported(node, device)
+        # Everything except an explicit '2of4'. Under the opt-out default ('auto') both this and
+        # the sparse variant match an eligible node; the sparse one has the higher plevel and is
+        # tried first, leaving this as the fallback if it cannot resolve.
+        return (
+            requested_contract(node) == self.contract
+            and requested_sparsity(node) != '2of4'
+            and bitwidths_supported(node, device)
+        )
 
     def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
         io_route, _, _ = parse_directives(directives)
