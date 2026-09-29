@@ -12,6 +12,7 @@ from hls4ml.model.types import PrecisionType
 
 from ...aie_types import QuantIntent, RoundingMode, SaturationMode
 from ...ir import LogicalIR, TensorVar
+from ...op_impls.families.matmul import DEFAULT_SPARSITY_MODE, SPARSITY_MODES
 
 
 def _to_quant_intent(precision: PrecisionType) -> QuantIntent:
@@ -112,6 +113,20 @@ def extract_layer_directives(layer, model) -> Dict[str, Any]:
     layout = cfg(layer, 'layout')
     if layout is not None:
         directives['layout'] = str(layout)
+
+    sparsity_cfg = cfg(layer, 'sparsity')
+    if sparsity_cfg:
+        # Accept either the bare mode string or {'mode': ...}. Sparsity is opt-out, so the mode
+        # to reach for here is usually 'dense'.
+        mode = str(
+            sparsity_cfg.get('mode', DEFAULT_SPARSITY_MODE) if isinstance(sparsity_cfg, dict) else sparsity_cfg
+        )
+        if mode not in SPARSITY_MODES:
+            raise ValueError(
+                f'{getattr(layer, "name", "?")}: unknown sparsity mode {mode!r}; '
+                f'expected one of {sorted(SPARSITY_MODES)}.'
+            )
+        directives['sparsity'] = {'mode': mode}
 
     io_route_cfg = cfg(layer, 'io_route', {})
     if io_route_cfg:

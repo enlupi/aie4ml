@@ -10,6 +10,7 @@ from ...device_catalog import load_device_catalog
 from ...ir import BackendPolicies
 from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
 from ...ir.graph import TENSOR_LAYOUTS
+from ...op_impls.families.matmul import DEFAULT_SPARSITY_MODE, SPARSITY_MODES
 from ...system_plan import normalize_pl_config
 from ..common import register_default_traits
 
@@ -83,6 +84,20 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
             parallelism['contract'] = str(parallel_cfg['contract'])
         if parallelism:
             directives['parallelism'] = parallelism
+
+    if 'sparsity' in raw:
+        sparsity_cfg = raw['sparsity']
+        # Accept the bare mode string as shorthand for {'mode': ...}, since 'mode' is the only
+        # key the 2:4 format has anything to parameterise. Sparsity is opt-out, so the mode to
+        # reach for here is usually 'dense'.
+        if isinstance(sparsity_cfg, str):
+            sparsity_cfg = {'mode': sparsity_cfg}
+        if not isinstance(sparsity_cfg, dict):
+            raise TypeError(f'{name}: sparsity override must be a dict or a mode string.')
+        mode = str(sparsity_cfg.get('mode', DEFAULT_SPARSITY_MODE))
+        if mode not in SPARSITY_MODES:
+            raise ValueError(f'{name}: unknown sparsity mode {mode!r}; expected one of {sorted(SPARSITY_MODES)}.')
+        directives['sparsity'] = {'mode': mode}
 
     if 'io_route' in raw:
         io_route = raw['io_route']

@@ -65,6 +65,7 @@ class AIEBackend(Backend):
             ConfigurableAttribute('cas_num', default=-1),
             ConfigurableAttribute('cas_length', default=-1),
             ConfigurableAttribute('microtiling', value_type=dict, default={}),
+            ConfigurableAttribute('sparsity', value_type=dict, default={}),
             Attribute('placement', value_type=dict, default={}, configurable=True),
         ]
         for attr in custom_dense_attrs:
