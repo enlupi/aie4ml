@@ -43,6 +43,11 @@ class DenseConfig:
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
     flags: DenseFlags
+    # Structured sparsity of the weight (B) matrix: 'dense', or '2of4' for the AIE-ML hardware
+    # sparse `aie::mmul` path. `sparse_tile_bytes` is the compressed size of one (K, N) microtile
+    # and 0 when dense; it is the kernel's compile-time tile stride through the packed ROM.
+    sparsity: str = 'dense'
+    sparse_tile_bytes: int = 0
 
 
 @dataclass(frozen=True)

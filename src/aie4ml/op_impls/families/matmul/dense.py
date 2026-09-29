@@ -61,8 +61,30 @@ class _BaseDenseMatmulVariant(OpImplVariant):
             tile_inner_rhs=output_view.tile_inner,
             tile_inner_lhs_raw=lhs_view.tile_raw_inner,
             tile_inner_rhs_raw=output_view.tile_raw_inner,
+            wts_elems=self.weight_rom_elems(config, lhs_view, output_view),
         )
         return params
+
+    def weight_rom_elems(self, config, lhs_view, output_view) -> int:
+        """Elements in the per-(chain, cascade) weight ROM the kernel takes by reference.
+
+        The dense product K_slice * N_slice for a dense weight matrix; for a sparse one the
+        compressed tile count times the per-tile byte stride, which is smaller. The kernel
+        declares its `wts` parameter as `weight_t (&)[ConfigT::WTS_ELEMS]`, so this has to agree
+        with the packed artifact's length exactly or the ADF parameter port is mis-sized.
+
+        The sparse ROM is sized in bytes but handed over as `weight_t`, so the byte count is
+        divided by the weight's storage size. `_pack_sparse` reinterprets the same bytes the same
+        way, and the two must agree.
+        """
+        k_slice = int(lhs_view.tile_inner)
+        n_slice = int(output_view.tile_inner)
+        if int(getattr(config, 'sparse_tile_bytes', 0)) <= 0:
+            return k_slice * n_slice
+        microtile_k = int(config.microtiling.microtile_k)
+        microtile_n = int(config.microtiling.microtile_n)
+        rom_bytes = int(config.sparse_tile_bytes) * (k_slice // microtile_k) * (n_slice // microtile_n)
+        return rom_bytes // max(1, int(config.precision['rhs'].width) // 8)
 
     def kernel_outer_extent(self, lhs_view):
         """Rows this kernel loops over. Contract-specific: declared by each variant."""
