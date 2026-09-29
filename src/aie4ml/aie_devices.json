@@ -12,6 +12,21 @@
     "MaxMemTileInPorts": 8,
     "MaxMemTileOutPorts": 8
   },
+  "xilinx_vek280_base_202610_1": {
+    "DeviceName": "Vek280",
+    "Generation": "AIE-ML",
+    "Columns": 38,
+    "Rows": 8,
+    "ColumnStart": 7,
+    "RowStart": 0,
+    "PLIOWidthBits": 128,
+    "PLClockFreqMHz": 312.5,
+    "Memory": { "BankMemBytes": 16384 },
+    "MaxMemTileInPorts": 8,
+    "MaxMemTileOutPorts": 8,
+    "UltraRAM": { "BlockBytes": 36864, "Blocks": 264, "Depth": 4096, "WidthBits": 72 },
+    "BlockRAM": { "BlockBytes": 4608, "Blocks": 600, "Depth": 512, "WidthBits": 72 }
+  },
   "xilinx_vek280_base_202520_1": {
     "DeviceName": "Vek280",
     "Generation": "AIE-ML",

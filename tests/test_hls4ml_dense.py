@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import pytest
+from aie_platform import resolve_aie_part
 
 
 def _require_vitis():
@@ -87,6 +88,7 @@ def _make_aie_model(tmp_path, cfg_dict, input_shape):
         project_name='proj_aie',
         batch_size=cfg_dict['batch'],
         iterations=5,
+        part=resolve_aie_part(),
     )
 
     return qmodel, aie_model
@@ -193,6 +195,7 @@ def test_aie_compile_x86_sim_nd_input(tmp_path: Path, input_shape):
         project_name='proj_aie',
         batch_size=B,
         iterations=5,
+        part=resolve_aie_part(),
     )
 
     aie_model.compile()

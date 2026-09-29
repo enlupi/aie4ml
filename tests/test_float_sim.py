@@ -4,6 +4,7 @@ import os
 
 import numpy as np
 import pytest
+from aie_platform import resolve_aie_part
 
 
 def _require_vitis():
@@ -104,6 +105,7 @@ def test_float_conversion(tmp_path, compute_dtype, rtol, atol):
         batch_size=BATCH,
         iterations=3,
         compute_dtype=compute_dtype,
+        part=resolve_aie_part(),
     )
     assert aie_model is not None
 
@@ -127,6 +129,7 @@ def test_float_x86sim(tmp_path, compute_dtype, rtol, atol):
         batch_size=BATCH,
         iterations=3,
         compute_dtype=compute_dtype,
+        part=resolve_aie_part(),
     )
     aie_model.compile()
 

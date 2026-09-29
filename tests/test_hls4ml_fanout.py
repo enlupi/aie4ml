@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import pytest
+from aie_platform import resolve_aie_part
 
 BATCH = 1
 ITERATIONS = 5
@@ -104,6 +105,7 @@ def _make_aie_model(tmp_path, input_shape, cfg_layers, bits_in, bits_w, hidden, 
         project_name='proj_aie',
         batch_size=BATCH,
         iterations=ITERATIONS,
+        part=resolve_aie_part(),
     )
     return qmodel, aie_model
 
