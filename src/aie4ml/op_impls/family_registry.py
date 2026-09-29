@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from .base import OpImplVariant
+
+log = logging.getLogger(__name__)
 
 
 class FamilyResolver:
@@ -19,10 +22,26 @@ class FamilyResolver:
 
         self.validate_structure(node, device)
         for variant in get_op_impl_registry().candidates(self.op_type):
-            if variant.matches(node, device):
+            if not variant.matches(node, device):
+                continue
+            try:
                 config = variant.resolve(node, device, directives)
-                return config, variant
-        raise ValueError(f'{node.name}: no {self.op_type} variant matches ' f'(generation={device.generation!r}).')
+            except Exception as exc:
+                # A variant that offered itself (rather than being asked for) must not be able to
+                # break a graph a lower-priority variant would have compiled, so let the next
+                # candidate try. Anything explicitly requested propagates.
+                if not variant.selection_is_speculative(node, device):
+                    raise
+                log.warning(
+                    '%s: %s was selected automatically but could not be resolved (%s); '
+                    'falling back to the next matching implementation.',
+                    node.name,
+                    variant.variant_id or type(variant).__name__,
+                    exc,
+                )
+                continue
+            return config, variant
+        raise ValueError(f'{node.name}: no {self.op_type} variant matches (generation={device.generation!r}).')
 
 
 class FamilyResolverRegistry:

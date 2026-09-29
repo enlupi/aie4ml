@@ -34,6 +34,18 @@ class OpImplVariant:
     def matches(self, _node: OpNode, _device: Any) -> bool:
         raise NotImplementedError
 
+    def selection_is_speculative(self, _node: OpNode, _device: Any) -> bool:
+        """Whether this variant was selected opportunistically rather than requested.
+
+        When True and `resolve()` raises, `FamilyResolver.resolve()` moves on to the next
+        matching candidate instead of failing the build -- the variant offered itself, so it must
+        not be able to break a graph that a lower-priority variant would have compiled. When
+        False (the default, and every explicitly requested variant) a `resolve()` failure
+        propagates, because silently downgrading something the user asked for is worse than
+        stopping.
+        """
+        return False
+
     def resolve(self, _node: OpNode, _device: Any, _directives: Optional[Dict[str, Any]] = None) -> Any:
         raise NotImplementedError
 
