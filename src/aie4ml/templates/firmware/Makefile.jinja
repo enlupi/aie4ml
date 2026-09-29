@@ -1,4 +1,7 @@
 SHELL := /bin/bash
+# The recipes below pipe into `tee`, so without pipefail the exit status is tee's (always 0)
+# and a failed v++ or simulator run still makes `make` succeed.
+.SHELLFLAGS := -o pipefail -c
 
 # ---------- User toggles ----------
 AIE_SIM_ONLY ?= false
