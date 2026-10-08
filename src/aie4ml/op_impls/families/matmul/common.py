@@ -109,18 +109,58 @@ SUBSTANTIAL_SPARSITY_FRACTION = 0.5
 # sample taking two mask bits (`lmask[i] = (local_mask >> i*2) & 0x3`).
 SPARSE_CHUNK_DATA_BYTES = 64
 
+# The chunk size is generation-specific; everything else about the stream (one mask bit per byte,
+# LSB-first, the kept values in ascending position order, 2 per group of 4) is shared.
+#
+# AIE-MLv2 masks every *16* bytes of uncompressed data: a 2-byte mask followed by 8 data bytes,
+# which is exactly one tile column for every AIE-MLv2 sparse microtile (int8 K = 16, int16 K = 8).
+# Measured, not transcribed: UG1603 says "for AIE-ML v2, data chunks are 512-bit wide, and the
+# mask and alignment is on 64 bits", and a ROM laid out that way is misread -- aiesimulator raises
+# `sparsity_overflow` because data bytes are parsed as masks. The 16-byte geometry was recovered
+# by feeding hand-built ROMs through an identity input and reading back the effective B matrix;
+# it predicts every element of both the x86simulator and the aiesimulator output (Vitis 2026.1.1,
+# VEK385), for int8 x int8 and int16 x int16. The total per tile is unchanged, so
+# sparse_tile_bytes() and the kernel strides are shared. See docs/sparse_dense_bugfixes.md.
+SPARSE_CHUNK_DATA_BYTES_BY_GENERATION = {
+    'AIE-ML': SPARSE_CHUNK_DATA_BYTES,
+    'AIE-MLV2': 16,
+}
+
 # Weight storage widths the packer implements. Both have a sparse `aie::mmul` overload and a
 # decompression path in me_native.h (`sparse_read8b` / `sparse_read16b`). 4-bit sparse weights
 # exist in the AIE API table (`8b x 4b`, AIE-ML only) but aie4ml has no 4-bit dense path to build
 # on, and 32-bit has no sparse mode on any generation.
 SPARSE_ELEMENT_BITS = frozenset({8, 16})
 
+# Per generation. On AIE-MLv2 the same 16-byte chunk holds 8 int16 samples, each owning two
+# adjacent mask bits exactly as on AIE-ML. Measured separately for int16 x int16 at both
+# microtiles, over all six kept-pair patterns of a group of 4 (adjacent pairs included); the
+# int8 layout does not imply it, since 16-bit data does not decode through the byte-level
+# partial-decompression table (two adjacent kept samples give a `1111` nibble it cannot express).
+SPARSE_ELEMENT_BITS_BY_GENERATION = {
+    'AIE-ML': SPARSE_ELEMENT_BITS,
+    'AIE-MLV2': SPARSE_ELEMENT_BITS,
+}
 
-def sparse_chunk_elems(element_bits: int = 8) -> int:
+
+def sparse_chunk_data_bytes(generation: str = 'AIE-ML') -> int:
+    """Bytes of uncompressed data one mask covers on this generation."""
+    key = select_generation_key(generation)
+    if key not in SPARSE_CHUNK_DATA_BYTES_BY_GENERATION:
+        raise NotImplementedError(f'no sparse chunk layout is known for generation {generation!r}.')
+    return SPARSE_CHUNK_DATA_BYTES_BY_GENERATION[key]
+
+
+def sparse_element_bits(generation: str = 'AIE-ML') -> frozenset:
+    """Weight storage widths the sparse packer implements on this generation."""
+    return SPARSE_ELEMENT_BITS_BY_GENERATION.get(select_generation_key(generation), frozenset())
+
+
+def sparse_chunk_elems(element_bits: int = 8, chunk_data_bytes: int = SPARSE_CHUNK_DATA_BYTES) -> int:
     """Elements one mask+data chunk covers, for a given element width."""
     if element_bits % 8:
         raise NotImplementedError(f'sparse element width must be a whole number of bytes, got {element_bits}-bit.')
-    return SPARSE_CHUNK_DATA_BYTES // (element_bits // 8)
+    return int(chunk_data_bytes) // (element_bits // 8)
 
 
 def requested_sparsity(node) -> str:
@@ -212,9 +252,11 @@ def sparse_capability(node, device) -> Tuple[bool, str]:
         rhs_width = int(resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name).width)
     except Exception as exc:
         return False, f'weight storage width is not resolvable ({exc})'
-    if rhs_width not in SPARSE_ELEMENT_BITS:
+    allowed_bits = sparse_element_bits(generation)
+    if rhs_width not in allowed_bits:
         return False, (
-            f'weight packing is implemented for {sorted(SPARSE_ELEMENT_BITS)}-bit weights, got {rhs_width}-bit'
+            f'weight packing is implemented for {sorted(allowed_bits)}-bit weights on {generation!r}, '
+            f'got {rhs_width}-bit'
         )
 
     options = sparse_microtiling_options(generation, node)
@@ -765,27 +807,37 @@ def report_unusable_sparsity(node, device) -> None:
     )
 
 
-def _compress_sparse_tile(values: np.ndarray, kept: np.ndarray, *, element_bits: int = 8) -> bytes:
-    """Compress one (K, N) microtile into AIE-ML sparse bytes.
+def _compress_sparse_tile(
+    values: np.ndarray,
+    kept: np.ndarray,
+    *,
+    element_bits: int = 8,
+    chunk_data_bytes: int = SPARSE_CHUNK_DATA_BYTES,
+) -> bytes:
+    """Compress one (K, N) microtile into hardware sparse bytes.
 
     Column-major element order over the whole tile -- column 0's K values, then column 1's, ...
     -- exactly as UG1603 ("compressed or decompressed column-wise") and the aie_api mmul note
-    ("sparse data be stored in column major layout") specify. Each chunk is an 8-byte mask
-    followed by the kept values in ascending position order, only for set bits.
+    ("sparse data be stored in column major layout") specify. Each chunk is a mask followed by
+    the kept values in ascending position order, only for set bits.
 
     The mask is one bit per *byte* of uncompressed data, which is the single rule that makes this
     width-independent: an 8-bit sample takes one mask bit, a 16-bit sample takes two adjacent mask
     bits (both set when the sample is stored, matching how me_native.h's `decompress_sparse` tests
     each 2-bit field with `bool()`). Bits run LSB-first within each mask byte, mask bytes
-    ascending. So one chunk always covers SPARSE_CHUNK_DATA_BYTES of original data and always
-    emits 8 mask bytes plus SPARSE_CHUNK_DATA_BYTES/SPARSITY_RATIO data bytes -- a constant, so
-    no guard padding is needed to keep the next mask 32-bit aligned, and the kernel can address
-    tiles by a compile-time stride.
+    ascending. So one chunk always covers `chunk_data_bytes` of original data and always emits
+    `chunk_data_bytes / 8` mask bytes plus `chunk_data_bytes / SPARSITY_RATIO` data bytes -- a
+    constant, so no guard padding is needed, and the kernel can address tiles by a compile-time
+    stride. `chunk_data_bytes` is the generation's (SPARSE_CHUNK_DATA_BYTES_BY_GENERATION): 64 on
+    AIE-ML, 16 on AIE-MLv2; the byte stream is otherwise identical.
     """
     K, N = values.shape
     elems = K * N
     itemsize = int(element_bits) // 8
-    chunk_elems = sparse_chunk_elems(element_bits)
+    chunk_data_bytes = int(chunk_data_bytes)
+    if chunk_data_bytes <= 0 or chunk_data_bytes % 8:
+        raise ValueError(f'sparse chunk must cover a positive multiple of 8 bytes, got {chunk_data_bytes}.')
+    chunk_elems = sparse_chunk_elems(element_bits, chunk_data_bytes)
     if elems % chunk_elems != 0:
         raise NotImplementedError(
             f'microtile {K}x{N} has {elems} elements, not a multiple of the {chunk_elems}-element '
@@ -795,8 +847,8 @@ def _compress_sparse_tile(values: np.ndarray, kept: np.ndarray, *, element_bits:
     flat_vals = values.T.reshape(-1)
     flat_kept = kept.T.reshape(-1)
 
-    mask_bytes_per_chunk = SPARSE_CHUNK_DATA_BYTES // 8
-    data_bytes_per_chunk = SPARSE_CHUNK_DATA_BYTES // SPARSITY_RATIO
+    mask_bytes_per_chunk = chunk_data_bytes // 8
+    data_bytes_per_chunk = chunk_data_bytes // SPARSITY_RATIO
     twos_complement = (1 << int(element_bits)) - 1
 
     out = bytearray()
@@ -834,6 +886,7 @@ def pack_mmul_rhs_sparse_matrix(
     cas_num: int,
     dtype=None,
     layer_name: str = '',
+    chunk_data_bytes: int = SPARSE_CHUNK_DATA_BYTES,
 ):
     """Pack the RHS for the sparse `aie::mmul` overload, mirroring pack_mmul_rhs_matrix.
 
@@ -851,6 +904,9 @@ def pack_mmul_rhs_sparse_matrix(
     per column is load-bearing -- two concurrently-live streams are bit-exact under
     x86simulator but wrong under aiesimulator, because the sparse decompression FIFO is real
     shared state on the AIE core that x86sim models only as bookkeeping.
+
+    `chunk_data_bytes` selects the generation's mask granularity; see
+    SPARSE_CHUNK_DATA_BYTES_BY_GENERATION.
     """
     prefix = f'{layer_name}: ' if layer_name else ''
     if microtile_k <= 0 or microtile_n <= 0:
@@ -910,7 +966,12 @@ def pack_mmul_rhs_sparse_matrix(
                     for nt in (2 * pair, 2 * pair + 1):
                         ks = slice(kt * microtile_k, (kt + 1) * microtile_k)
                         ns = slice(nt * microtile_n, (nt + 1) * microtile_n)
-                        blob += _compress_sparse_tile(values[ks, ns], kept[ks, ns], element_bits=element_bits)
+                        blob += _compress_sparse_tile(
+                            values[ks, ns],
+                            kept[ks, ns],
+                            element_bits=element_bits,
+                            chunk_data_bytes=chunk_data_bytes,
+                        )
             if len(blob) != flat_len:
                 raise AssertionError(f'{prefix}packed {len(blob)} bytes, expected {flat_len}.')
             packed[chain, cas] = np.frombuffer(bytes(blob), dtype=np.uint8)

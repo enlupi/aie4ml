@@ -112,9 +112,11 @@ public:
   }
 };
 
-// Sparse: the weight ROM was packed by pack_mmul_rhs_sparse_matrix() into the AIE-ML hardware
-// sparse (2:4) format: each (K,N) microtile is compressed column-major and occupies a fixed
+// Sparse: the weight ROM was packed by pack_mmul_rhs_sparse_matrix() into the target generation's
+// hardware sparse (2:4) format: each (K,N) microtile is compressed column-major and occupies a fixed
 // ConfigT::SPARSE_TILE_BYTES (== aie::sparse_vector<weight_t, MMUL::size_B>::memory_bytes()).
+// AIE-ML and AIE-MLv2 differ only in mask granularity inside that tile (64 vs 16 uncompressed bytes
+// per mask), which is the packer's concern -- nothing here depends on it.
 // Tiles are grouped by the (j, j+1) N-tile pair this feeder serves, then by K-tile, then by the
 // two columns: tile(kt=0,j), tile(kt=0,j+1), tile(kt=1,j), tile(kt=1,j+1), ...
 //

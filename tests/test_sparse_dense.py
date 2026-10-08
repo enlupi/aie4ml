@@ -549,21 +549,24 @@ def test_aie_mlv2_has_no_mixed_dtype_sparse_pairing():
         assert lhs_fmt == rhs_fmt, f'AIE-MLv2 sparse pairing {(lhs_fmt, rhs_fmt)} is mixed-dtype'
 
 
-def _decode_sparse_tile(blob, microtile_k, microtile_n, element_bits=8):
+def _decode_sparse_tile(blob, microtile_k, microtile_n, element_bits=8, chunk_data_bytes=None):
     """Independent reference decoder for one compressed (K, N) microtile.
 
     Written from UG1603 and me_native.h rather than from the encoder, so a shared misreading
     cannot cancel out. The mask is one bit per *byte* of uncompressed data, so an int8 sample owns
     one mask bit and an int16 sample owns two adjacent ones; a sample is stored iff its first bit
-    is set. Each chunk covers SPARSE_CHUNK_DATA_BYTES of original data as an 8-byte mask plus a
-    constant SPARSE_CHUNK_DATA_BYTES/2 data bytes.
+    is set. Each chunk covers `chunk_data_bytes` of original data (SPARSE_CHUNK_DATA_BYTES, the
+    AIE-ML value, by default; 16 on AIE-MLv2) as a `chunk_data_bytes/8`-byte mask plus a constant
+    `chunk_data_bytes/2` data bytes.
     """
     np = pytest.importorskip('numpy')
     from aie4ml.op_impls.families.matmul.common import SPARSE_CHUNK_DATA_BYTES, sparse_chunk_elems
 
+    if chunk_data_bytes is None:
+        chunk_data_bytes = SPARSE_CHUNK_DATA_BYTES
     itemsize = element_bits // 8
-    chunk_elems = sparse_chunk_elems(element_bits)
-    mask_bytes = SPARSE_CHUNK_DATA_BYTES // 8
+    chunk_elems = sparse_chunk_elems(element_bits, chunk_data_bytes)
+    mask_bytes = chunk_data_bytes // 8
     flat = np.zeros(microtile_k * microtile_n, dtype=np.int64)
     off = 0
     for chunk in range(flat.size // chunk_elems):
@@ -580,8 +583,8 @@ def _decode_sparse_tile(blob, microtile_k, microtile_n, element_bits=8):
                 raw -= 1 << element_bits
             flat[chunk * chunk_elems + local] = raw
             taken += 1
-        assert taken * itemsize == SPARSE_CHUNK_DATA_BYTES // 2, 'every group of 4 must keep exactly 2'
-        off += SPARSE_CHUNK_DATA_BYTES // 2
+        assert taken * itemsize == chunk_data_bytes // 2, 'every group of 4 must keep exactly 2'
+        off += chunk_data_bytes // 2
     assert off == len(blob)
     return flat.reshape(microtile_n, microtile_k).T
 
@@ -1031,6 +1034,129 @@ def test_sparse_matches_dense_in_simulation(tmp_path, simulator, case):
         if label == 'sparse':
             mt = entry.config.microtiling
             assert (mt.microtile_m, mt.microtile_k, mt.microtile_n) == microtile
+        model.write()
+        model.build(make_target='x86com' if simulator == 'x86' else 'compile')
+        outputs[label] = np.asarray(model.predict(X, simulator=simulator))
+
+    np.testing.assert_array_equal(outputs['sparse'], outputs['dense'])
+
+
+# AIE-MLv2. The rest of the suite targets Vek280 (tests/aie_platform.py); these build against
+# the VEK385 catalog entry, which needs no toolchain for lowering.
+MLV2_PART = 'vek385_base'
+
+
+# Every AIE-MLv2 sparse pairing aie4ml reaches, at each of its microtiles: (act, weight, microtile).
+MLV2_SPARSE_CASES = [
+    (8, 8, (4, 16, 8)),
+    (8, 8, (8, 16, 8)),
+    (16, 16, (2, 8, 8)),
+    (16, 16, (4, 8, 8)),
+]
+
+
+@pytest.mark.parametrize(
+    'act_width,wt_width,microtile', MLV2_SPARSE_CASES, ids=[f'int{a}xint{w}-{m}' for a, w, m in MLV2_SPARSE_CASES]
+)
+def test_aie_mlv2_packs_sixteen_byte_sparse_chunks(tmp_path, act_width, wt_width, microtile):
+    """AIE-MLv2 masks every 16 uncompressed bytes (2-byte mask + 8 data bytes), not every 64.
+
+    Measured in x86simulator and aiesimulator (Vitis 2026.1.1): the AIE-ML 64-byte layout is
+    misread on AIE-MLv2 -- for int8, aiesim raises `sparsity_overflow` and 289 of 512 outputs of
+    an identity readback are wrong; for int16, 267 of 512 -- while the 16-byte layout is exact for
+    both widths. The tile size is the same either way, which is why a wrong chunk size is
+    invisible to every size and stride check and has to be pinned here.
+    """
+    np = pytest.importorskip('numpy')
+    ctx, _ = _build(
+        tmp_path,
+        part=MLV2_PART,
+        microtile=microtile,
+        in_feat=32,
+        out_feat=16,
+        act_width=act_width,
+        wt_width=wt_width,
+    )
+    entry = _entry(ctx)
+    assert entry.config.sparsity == '2of4'
+    assert entry.config.sparse_chunk_bytes == 16
+    mt = entry.config.microtiling
+    assert (mt.microtile_m, mt.microtile_k, mt.microtile_n) == microtile
+    elems = mt.microtile_k * mt.microtile_n
+    tile_bytes = entry.config.sparse_tile_bytes
+    assert tile_bytes == (elems // 2) * wt_width // 8 + elems * wt_width // 64
+
+    rom = np.asarray(entry.artifacts['packed_weights']).reshape(-1).view(np.uint8)
+    W = _weights_2of4(in_feat=32, out_feat=16)
+    Wq = np.round(W * 2**W_FRAC).astype(np.int64)
+    # Tiles run pair (0, 1) -> K-tile -> column tile, as the kernel pops them.
+    off = 0
+    for kt in range(32 // mt.microtile_k):
+        for nt in (0, 1):
+            tile = _decode_sparse_tile(
+                rom[off : off + tile_bytes], mt.microtile_k, mt.microtile_n, wt_width, chunk_data_bytes=16
+            )
+            off += tile_bytes
+            ks = slice(kt * mt.microtile_k, (kt + 1) * mt.microtile_k)
+            ns = slice(nt * mt.microtile_n, (nt + 1) * mt.microtile_n)
+            np.testing.assert_array_equal(tile, Wq[ks, ns])
+    assert off == rom.size
+
+
+def test_aie_mlv2_int16_weights_select_the_int16_sparse_microtile(tmp_path):
+    """With no directive, already-2:4 int16 x int16 goes sparse on AIE-MLv2, at a 16x16 shape."""
+    from aie4ml.op_impls.families.matmul import SPARSE_MICROTILE_OPTIONS
+
+    ctx, _ = _build(tmp_path, part=MLV2_PART, act_width=16, wt_width=16)
+    entry = _entry(ctx)
+    assert entry.config.sparsity == '2of4'
+    mt = entry.config.microtiling
+    assert (mt.microtile_m, mt.microtile_k, mt.microtile_n) in SPARSE_MICROTILE_OPTIONS['AIE-MLV2'][('int16', 'int16')]
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('width', [8, 16], ids=['int8xint8', 'int16xint16'])
+def test_aie_mlv2_sparse_matches_dense_in_aiesim(tmp_path, width):
+    """Differential sparse-vs-dense run with the AIE-MLv2 sparse side cycle-accurate.
+
+    The sparse side runs in aiesim only: before Vitis 2026.1.1 the aie2ps x86 model had no sparse
+    decompression at all, so x86sim is not a reliable oracle for it across installs. Both widths
+    are run because they decode differently -- an int16 sample owns two mask bits.
+
+    The dense reference is AIE-MLv2 dense for int8. For int16 it is AIE-ML dense in x86sim (sound on
+    AIE-ML, and verified there), because AIE-MLv2 *dense* int16 x int16 does not compile: its only
+    dense microtile, (8, 2, 8), has no acc64 overload on AIE-MLv2 -- a dense-table problem recorded
+    in docs/sparse_dense_bugfixes.md. Integer accumulation is exact on both generations, so the
+    outputs must still agree bit for bit.
+
+    Kept deliberately small: each AIE-MLv2 side is a full `--target=hw` compile.
+    """
+    _require_vitis()
+    from aie_platform import installed_platforms
+
+    if MLV2_PART not in installed_platforms():
+        pytest.skip(f'{MLV2_PART} base platform is not installed')
+    np = pytest.importorskip('numpy')
+
+    weights = _weights_2of4(seed=5, in_feat=32, out_feat=16)
+    X = np.random.default_rng(5).normal(0, 0.5, size=(BATCH, 32))
+    ref_part, ref_sim = (MLV2_PART, 'aie') if width == 8 else (PART, 'x86')
+    outputs = {}
+    for label, sparsity, part, simulator in (
+        ('dense', 'dense', ref_part, ref_sim),
+        ('sparse', '2of4', MLV2_PART, 'aie'),
+    ):
+        ctx, model = _build(
+            tmp_path / label,
+            sparsity=sparsity,
+            part=part,
+            weights=weights,
+            in_feat=32,
+            out_feat=16,
+            act_width=width,
+            wt_width=width,
+        )
+        assert (_entry(ctx).config.sparsity == '2of4') == (label == 'sparse')
         model.write()
         model.build(make_target='x86com' if simulator == 'x86' else 'compile')
         outputs[label] = np.asarray(model.predict(X, simulator=simulator))

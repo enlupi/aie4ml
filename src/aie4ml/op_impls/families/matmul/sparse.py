@@ -63,6 +63,8 @@ from .common import (
     requested_contract,
     requested_sparsity,
     select_generation_key,
+    sparse_chunk_data_bytes,
+    sparse_element_bits,
     sparse_eligibility,
     sparse_tile_bytes,
 )
@@ -161,6 +163,7 @@ class _DenseSparseVariantBase(_DenseVariantBase):
             sparse_tile_bytes=sparse_tile_bytes(
                 microtiling.microtile_k, microtiling.microtile_n, int(precision['rhs'].width)
             ),
+            sparse_chunk_bytes=sparse_chunk_data_bytes(str(getattr(device, 'generation', '') or '')),
         )
 
     def _reject_unsupported(self, node: OpNode, device) -> None:
@@ -187,12 +190,19 @@ class _DenseSparseVariantBase(_DenseVariantBase):
     def validate_config(self, node: OpNode, config: DenseConfig, device) -> None:
         super().validate_config(node, config, device)
 
+        generation = str(getattr(device, 'generation', '') or '')
         rhs_bits = int(config.precision['rhs'].width)
-        if rhs_bits not in SPARSE_ELEMENT_BITS:
+        allowed_bits = sparse_element_bits(generation)
+        if rhs_bits not in allowed_bits:
             raise NotImplementedError(
                 f'{node.name}: sparse weight packing is implemented for '
-                f'{sorted(SPARSE_ELEMENT_BITS)}-bit weights, got {rhs_bits}-bit; the mask '
+                f'{sorted(allowed_bits)}-bit weights on {generation!r}, got {rhs_bits}-bit; the mask '
                 'granularity and chunking would need re-deriving.'
+            )
+        if int(config.sparse_chunk_bytes) != sparse_chunk_data_bytes(generation):
+            raise ValueError(
+                f'{node.name}: resolved sparse chunk of {config.sparse_chunk_bytes} bytes does not match '
+                f'the {sparse_chunk_data_bytes(generation)}-byte layout of {generation!r}.'
             )
 
         microtile = (config.microtiling.microtile_m, config.microtiling.microtile_k, config.microtiling.microtile_n)
@@ -255,6 +265,7 @@ class _DenseSparseVariantBase(_DenseVariantBase):
             cas_num=1 if n_slice_scale > 1 else cas_num,
             dtype=np_dtype_for_spec(p.precision['rhs']),
             layer_name=inst.name,
+            chunk_data_bytes=p.sparse_chunk_bytes,
         )
         if n_slice_scale > 1:
             packed_W = np.repeat(packed_W, cas_num, axis=0)
